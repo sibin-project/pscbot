@@ -198,13 +198,11 @@ bot.on('poll', async (ctx) => {
 module.exports = async (req, res) => {
   await connectDB();
   
-  // Handle Vercel Cron
   if (req.url === '/api/cron') {
     await postToAllChats();
     return res.status(200).send('Cron Job Executed');
   }
 
-  // Handle Telegram Webhook
   if (req.method === 'POST') {
     await bot.handleUpdate(req.body);
     return res.status(200).send('OK');
@@ -213,11 +211,19 @@ module.exports = async (req, res) => {
   res.status(200).send('Bot is online!');
 };
 
-// --- Local Execution ---
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+// --- Koyeb / Local Persistent Server ---
+if (!process.env.VERCEL) {
+  const express = require('express');
+  const app = express();
+  
+  app.get('/', (req, res) => res.send('Bot is running! 🚀'));
+  
+  const PORT = process.env.PORT || 8000;
+  app.listen(PORT, () => console.log(`🌍 Health check server on port ${PORT}`));
+
   connectDB().then(() => {
     bot.launch();
-    console.log('✅ Local bot is running');
+    console.log('✅ Bot is running');
     setInterval(() => {
       minutesUntilNextPost--;
       if (minutesUntilNextPost <= 0) postToAllChats();
