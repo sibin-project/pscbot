@@ -1,0 +1,18 @@
+{
+  "name": "pscbot",
+  "version": "1.0.0",
+  "description": "Kerala PSC Telegram Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.50.1",
+    "dotenv": "^16.4.5",
+    "mongoose": "^8.3.0",
+    "node-cron": "^3.0.3",
+    "nodemon": "^3.1.14",
+    "telegraf": "^4.16.3"
+  }
+}
