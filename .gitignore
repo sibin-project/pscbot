@@ -3,5 +3,4 @@ node_modules/
 deregister_ai_chat.js
 export_chats.js
 registered_chats.json
-package-lock.json
 *.log
