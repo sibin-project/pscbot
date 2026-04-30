@@ -115,7 +115,13 @@ async function postToAllChats() {
     }
     
     if (!q) {
-      console.log("❌ Skip: No questions available.");
+      console.log("♻️ Still no questions available (AI limit). Resetting history...");
+      await Question.updateMany({}, { is_posted: false });
+      q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
+    }
+
+    if (!q) {
+      console.log("❌ Skip: No questions available even after reset.");
       return;
     }
 
@@ -124,7 +130,7 @@ async function postToAllChats() {
 
     const adminMsg = await bot.telegram.sendPoll(sourceId, q.question, q.options, {
       type: 'quiz', correct_option_id: q.correct_option_index, is_anonymous: true,
-      explanation: `Correct answer: ${q.options[q.correct_option_index]}`
+      explanation: `Correct answer: ${q.options[q.correct_option_index]}\n\nJoin our channel for more: ${CHANNEL_LINK}`
     });
     await State.updateOne({ key: `poll_${adminMsg.poll.id}` }, { value: { chat_id: sourceId, voted: false } }, { upsert: true });
 
@@ -183,9 +189,20 @@ bot.on('poll', async (ctx) => {
     if (marathon && marathon.value.count < marathon.value.target) {
       marathon.value.count++; marathon.markModified('value'); await marathon.save();
       setTimeout(async () => {
-        const q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
+        let q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
+        if (!q) {
+          console.log("♻️ Marathon out of fresh questions. Resetting history...");
+          await Question.updateMany({}, { is_posted: false });
+          q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
+        }
+        
         if (q) {
-          const msg = await bot.telegram.sendPoll(pollState.value.chat_id, q.question, q.options, { type: 'quiz', correct_option_id: q.correct_option_index, is_anonymous: true });
+          const msg = await bot.telegram.sendPoll(pollState.value.chat_id, q.question, q.options, { 
+            type: 'quiz', 
+            correct_option_id: q.correct_option_index, 
+            is_anonymous: true,
+            explanation: `Correct answer: ${q.options[q.correct_option_index]}\n\nJoin our channel for more: ${CHANNEL_LINK}`
+          });
           await State.updateOne({ key: `poll_${msg.poll.id}` }, { value: { chat_id: pollState.value.chat_id, voted: false } }, { upsert: true });
           q.is_posted = true; await q.save();
         }
