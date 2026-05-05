@@ -1,4 +1,5 @@
 require('dotenv').config();
+process.env.TZ = 'Asia/Kolkata';
 const mongoose = require('mongoose');
 
 async function cleanup() {

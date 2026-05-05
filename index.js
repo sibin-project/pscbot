@@ -1,4 +1,5 @@
 require('dotenv').config();
+process.env.TZ = 'Asia/Kolkata';
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const { GoogleGenAI } = require('@google/genai');
