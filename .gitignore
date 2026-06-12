@@ -1,6 +1,4 @@
 node_modules/
 .env
-deregister_ai_chat.js
-export_chats.js
 registered_chats.json
 *.log

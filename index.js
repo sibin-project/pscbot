@@ -2,12 +2,10 @@ require('dotenv').config();
 process.env.TZ = 'Asia/Kolkata';
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
-const { GoogleGenAI } = require('@google/genai');
 const cron = require('node-cron');
 
 // --- Configuration ---
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const TOPICS = [
   'General Knowledge',
@@ -19,7 +17,6 @@ const TOPICS = [
   'Indian Constitution'
 ];
 const LEVELS = ['SSLC Level', 'Plus Two Level', 'Degree Level'];
-const MODEL_NAME = 'gemini-3-flash-preview';
 const TARGET_CHANNEL_ID = '-1003944522871';
 const CHANNEL_LINK = 'https://t.me/kerala_psc_study';
 
@@ -47,18 +44,6 @@ bot.catch((err, ctx) => {
   console.error('Global Bot Error:', err.message);
 });
 
-// --- MongoDB Models ---
-const QuestionSchema = new mongoose.Schema({
-  question: { type: String, unique: true, required: true },
-  options: { type: [String], required: true },
-  explanation: { type: String, required: true },
-  correct_option_index: { type: Number, required: true },
-  topic: String,
-  level: String,
-  is_posted: { type: Boolean, default: false },
-  created_at: { type: Date, default: Date.now }
-});
-
 const ChatSchema = new mongoose.Schema({
   chat_id: { type: String, unique: true },
   title: String,
@@ -71,56 +56,14 @@ const StateSchema = new mongoose.Schema({
   value: mongoose.Schema.Types.Mixed
 });
 
-const Question = mongoose.model('Question', QuestionSchema);
 const Chat = mongoose.model('Chat', ChatSchema);
 const State = mongoose.model('State', StateSchema);
+const Question = require('./models/Question');
+const CurrentAffairs = require('./models/CurrentAffairs');
 
-// --- LLM Logic ---
+// --- LLM Logic (Deprecated for now since we are moving to CA) ---
 async function generateQuestions(level, topic, count = 10) {
-  try {
-    await connectDB();
-    const rateLimitState = await State.findOne({ key: 'rate_limit_pause' });
-    if (rateLimitState && rateLimitState.value.paused_until > Date.now()) return [];
-
-    const historyState = await State.findOne({ key: 'history' });
-    const history = (historyState?.value || []).slice(-50).join(', ');
-    const prompt = `Generate ${count} unique Kerala PSC questions in JSON format. Each question object MUST have:
-    - "question": The question text
-    - "options": Array of 4 strings
-    - "correct_option_index": Number (0-3)
-    - "explanation": A brief explanation (max 150 chars)
-    Level: ${level}, Topic: ${topic}. History: [${history}]`;
-
-    const response = await ai.models.generateContent({ model: MODEL_NAME, contents: prompt });
-    const text = response.text;
-    const start = text.indexOf('[');
-    const end = text.lastIndexOf(']') + 1;
-    if (start === -1) return [];
-
-    const questions = JSON.parse(text.substring(start, end));
-    for (const q of questions) {
-      try {
-        await Question.create(q);
-      } catch (e) {}
-    }
-
-    await State.updateOne(
-      { key: 'history' },
-      { value: [...(historyState?.value || []), ...questions.map((q) => q.question)].slice(-50) },
-      { upsert: true }
-    );
-
-    return questions;
-  } catch (err) {
-    if (err.message.includes('quota') || err.message.includes('429')) {
-      await State.updateOne(
-        { key: 'rate_limit_pause' },
-        { value: { paused_until: Date.now() + 60 * 60 * 1000 } },
-        { upsert: true }
-      );
-    }
-    return [];
-  }
+  return [];
 }
 
 // --- Helper for Migration ---
@@ -141,36 +84,78 @@ async function handleMigration(err, oldId) {
 async function postPoll() {
   try {
     await connectDB();
-    let q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
-    if (!q) {
-      console.log('Out of questions. Attempting to generate more...');
-      await generateQuestions(LEVELS[0], TOPICS[0], 5);
-      q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
-    }
 
+    let q = await Question.findOne({ isPosted: { $ne: true } }).sort({ createdAt: 1 });
     if (!q) {
-      console.log('Still no questions available. Resetting history...');
-      await Question.updateMany({}, { is_posted: false });
-      q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
-    }
-
-    if (!q) {
-      console.log('Skip: No questions available.');
+      console.log('Skip: No regular questions available.');
       return;
     }
 
-    await bot.telegram.sendPoll(TARGET_CHANNEL_ID, q.question, q.options, {
+    const rawOptions = [
+      { key: 'A', value: q.options.A },
+      { key: 'B', value: q.options.B },
+      { key: 'C', value: q.options.C },
+      { key: 'D', value: q.options.D }
+    ].filter(o => Boolean(o.value));
+    
+    const options = rawOptions.map(o => o.value);
+    const correct_option_index = rawOptions.findIndex(o => o.key === q.correctAnswer || o.value === q.correctAnswer);
+
+    await bot.telegram.sendPoll(TARGET_CHANNEL_ID, q.question, options, {
       type: 'quiz',
-      correct_option_id: q.correct_option_index,
+      correct_option_id: correct_option_index,
       is_anonymous: true,
-      explanation: `${q.explanation}\n\nJoin our channel for more: ${CHANNEL_LINK}`
+      explanation: `${q.explanation || ''}\n\nJoin our channel for more: ${CHANNEL_LINK}`
     });
 
-    q.is_posted = true;
-    await q.save();
-    console.log(`Poll posted directly to ${TARGET_CHANNEL_ID}`);
+    await Question.updateOne({ _id: q._id }, { $set: { isPosted: true } });
+    console.log(`Regular Poll posted directly to ${TARGET_CHANNEL_ID}`);
   } catch (err) {
     console.error('Post Error:', err.message);
+  }
+}
+
+async function postPollCA() {
+  try {
+    await connectDB();
+
+    // Find the oldest CA document that has an unposted question
+    let caDoc = await CurrentAffairs.findOne({ questions: { $elemMatch: { isPosted: { $ne: true } } } }).sort({ date: 1 });
+
+    if (!caDoc) {
+      console.log('Skip: No CA questions available.');
+      return;
+    }
+
+    const qIndex = caDoc.questions.findIndex(q => q.isPosted !== true);
+    if (qIndex === -1) return;
+    const q = caDoc.questions[qIndex];
+
+    const rawOptions = [
+      { key: 'A', value: q.options.A },
+      { key: 'B', value: q.options.B },
+      { key: 'C', value: q.options.C },
+      { key: 'D', value: q.options.D }
+    ].filter(o => Boolean(o.value));
+    
+    const options = rawOptions.map(o => o.value);
+    const correct_option_index = rawOptions.findIndex(o => o.key === q.correctAnswer || o.value === q.correctAnswer);
+    const questionText = `${q.question}\n(Date: ${caDoc.dateDisplay || caDoc.date})`;
+
+    await bot.telegram.sendPoll(TARGET_CHANNEL_ID, questionText, options, {
+      type: 'quiz',
+      correct_option_id: correct_option_index,
+      is_anonymous: true,
+      explanation: `${q.explanation || ''}\n\nJoin our channel for more: ${CHANNEL_LINK}`
+    });
+
+    await CurrentAffairs.updateOne(
+      { _id: caDoc._id },
+      { $set: { [`questions.${qIndex}.isPosted`]: true } }
+    );
+    console.log(`CA Poll posted directly to ${TARGET_CHANNEL_ID}`);
+  } catch (err) {
+    console.error('Post CA Error:', err.message);
   }
 }
 
@@ -188,7 +173,6 @@ function getNextPollTime() {
     if (pollDate > now) return pollDate.toLocaleTimeString();
   }
   
-  // If all today's times passed, return 8 AM tomorrow
   return 'Tomorrow 08:00 AM';
 }
 
@@ -212,7 +196,7 @@ function scheduleWindowPosts(durationMinutes) {
   
   setTimeout(() => {
     console.log('Posting scheduled poll (2/2)...');
-    postPoll();
+    postPollCA();
   }, delay2);
 }
 
@@ -268,13 +252,18 @@ bot.help(adminOnly, async (ctx) => {
 
 bot.command(['postnow', 'gen'], adminOnly, async (ctx) => {
   await postPoll();
-  await ctx.reply('✅ Poll posted manually.');
+  await ctx.reply('✅ Regular Poll posted manually.');
+});
+
+bot.command('postnowca', adminOnly, async (ctx) => {
+  await postPollCA();
+  await ctx.reply('✅ CA Poll posted manually.');
 });
 
 bot.command('reset', adminOnly, async (ctx) => {
   await connectDB();
-  const result = await Question.updateMany({}, { is_posted: false });
-  ctx.reply(`✅ Reset ${result.modifiedCount} questions. They can now be posted again.`);
+  const result = await CurrentAffairs.updateMany({}, { $set: { 'questions.$[].isPosted': false } });
+  ctx.reply(`✅ Reset questions.`);
 });
 
 bot.command('users', adminOnly, async (ctx) => {
@@ -288,31 +277,83 @@ bot.command('users', adminOnly, async (ctx) => {
 });
 
 bot.command('cleanup', adminOnly, async (ctx) => {
-  await connectDB();
-  const result = await Question.deleteMany({
-    $or: [
-      { question: { $exists: false } },
-      { question: "" },
-      { options: { $exists: false } },
-      { options: { $size: 0 } },
-      { explanation: { $exists: false } },
-      { explanation: "" },
-      { correct_option_index: { $exists: false } }
-    ]
-  });
-  ctx.reply(`✅ Cleaned up ${result.deletedCount} invalid question sets.`);
+  ctx.reply(`Cleanup command is deprecated for CA flow.`);
+});
+
+// Admin upload state
+const adminFlowState = {};
+
+bot.command('upload_ca', adminOnly, async (ctx) => {
+  adminFlowState[ctx.from.id] = { step: 'date' };
+  await ctx.reply('Enter the CA Date (YYYY-MM-DD):');
 });
 
 // --- Admin Direct Post ---
 bot.on('message', async (ctx, next) => {
   const adminId = process.env.ADMIN;
-  // If admin sends something in PM and it's not a command
   if (ctx.chat.type === 'private' && ctx.from.id.toString() === adminId) {
     const text = ctx.message.text || '';
     if (text.startsWith('/')) {
-      return next(); // Let commands be handled by command handlers
+      return next(); 
     }
     
+    const state = adminFlowState[ctx.from.id];
+    if (state) {
+      if (state.step === 'date') {
+        state.date = text;
+        state.step = 'question';
+        await ctx.reply('Enter the Question:');
+      } else if (state.step === 'question') {
+        state.question = text;
+        state.step = 'optA';
+        await ctx.reply('Enter Option A:');
+      } else if (state.step === 'optA') {
+        state.options = { A: text };
+        state.step = 'optB';
+        await ctx.reply('Enter Option B:');
+      } else if (state.step === 'optB') {
+        state.options.B = text;
+        state.step = 'optC';
+        await ctx.reply('Enter Option C:');
+      } else if (state.step === 'optC') {
+        state.options.C = text;
+        state.step = 'optD';
+        await ctx.reply('Enter Option D:');
+      } else if (state.step === 'optD') {
+        state.options.D = text;
+        state.step = 'correct';
+        await ctx.reply('Enter Correct Answer (A/B/C/D):');
+      } else if (state.step === 'correct') {
+        state.correctAnswer = text.toUpperCase();
+        state.step = 'exp';
+        await ctx.reply('Enter Explanation (or type "skip"):');
+      } else if (state.step === 'exp') {
+        state.explanation = text.toLowerCase() === 'skip' ? '' : text;
+        
+        // Save to DB
+        try {
+          await connectDB();
+          let caDoc = await CurrentAffairs.findOne({ date: state.date });
+          if (!caDoc) {
+             caDoc = new CurrentAffairs({ date: state.date, dateDisplay: state.date, questions: [] });
+          }
+          caDoc.questions.push({
+             question: state.question,
+             options: state.options,
+             correctAnswer: state.correctAnswer,
+             explanation: state.explanation,
+             isPosted: false
+          });
+          await caDoc.save();
+          await ctx.reply('✅ CA Question saved successfully!');
+        } catch (err) {
+          await ctx.reply('❌ Error saving: ' + err.message);
+        }
+        delete adminFlowState[ctx.from.id];
+      }
+      return;
+    }
+
     try {
       await bot.telegram.copyMessage(TARGET_CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
       await ctx.reply('✅ Posted to channel.');
@@ -324,47 +365,129 @@ bot.on('message', async (ctx, next) => {
   return next();
 });
 
-bot.on('poll', async (ctx) => {
-  const poll = ctx.poll;
-  if (!poll || poll.total_voter_count === 0) return;
+// --- Quiz Marathon Logic ---
+const activeQuizzes = {}; // track in-memory: { chatId_userId: { score: 0, count: 0, target: 50, currentPollId: null, correctOptionIndex: 0 } }
 
-  await connectDB();
-  const pollState = await State.findOne({ key: `poll_${poll.id}` });
-  if (pollState && !pollState.value.voted) {
-    await State.updateOne({ key: `poll_${poll.id}` }, { 'value.voted': true });
-    const marathon = await State.findOne({ key: `marathon_${pollState.value.chat_id}` });
-    if (marathon && marathon.value.count < marathon.value.target) {
-      marathon.value.count++;
-      marathon.markModified('value');
-      await marathon.save();
+bot.command('quiz', async (ctx) => {
+  // Only allow in PM or groups where polls can be non-anonymous. Channels won't work.
+  if (ctx.chat.type === 'channel') {
+    return ctx.reply('❌ The /quiz command only works in private chats or groups.');
+  }
+  
+  const key = `${ctx.chat.id}_${ctx.from.id}`;
+  if (activeQuizzes[key]) {
+    return ctx.reply('❌ You already have an active quiz! Please answer the current question.');
+  }
 
-      setTimeout(async () => {
-        let q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
-        if (!q) {
-          console.log('Marathon out of fresh questions. Resetting history...');
-          await Question.updateMany({}, { is_posted: false });
-          q = await Question.findOne({ is_posted: false }).sort({ created_at: 1 });
-        }
+  activeQuizzes[key] = {
+    score: 0,
+    count: 0,
+    target: 50,
+    userId: ctx.from.id,
+    chatId: ctx.chat.id,
+    username: ctx.from.username || ctx.from.first_name,
+    currentPollId: null,
+    correctOptionIndex: 0
+  };
 
-        if (q) {
-          const msg = await bot.telegram.sendPoll(pollState.value.chat_id, q.question, q.options, {
-            type: 'quiz',
-            correct_option_id: q.correct_option_index,
-            is_anonymous: true,
-            explanation: `${q.explanation}\n\nJoin our channel for more: ${CHANNEL_LINK}`
-          });
+  await sendNextQuizQuestion(key);
+});
 
-          await State.updateOne(
-            { key: `poll_${msg.poll.id}` },
-            { value: { chat_id: pollState.value.chat_id, voted: false } },
-            { upsert: true }
-          );
+bot.command('end', async (ctx) => {
+  const key = `${ctx.chat.id}_${ctx.from.id}`;
+  const session = activeQuizzes[key];
+  if (!session) {
+    return ctx.reply('❌ You do not have an active quiz to end.');
+  }
 
-          q.is_posted = true;
-          await q.save();
-        }
-      }, 3000);
+  await ctx.reply(`🛑 Quiz Ended Early!\n\nUser: <a href="tg://user?id=${session.userId}">${session.username}</a>\nFinal Score: ${session.score} / ${session.count}`, { parse_mode: 'HTML' });
+  delete activeQuizzes[key];
+});
+
+async function sendNextQuizQuestion(key) {
+  const session = activeQuizzes[key];
+  if (!session) return;
+
+  if (session.count >= session.target) {
+    // Finish Quiz
+    await bot.telegram.sendMessage(session.chatId, `🎉 Quiz Finished!\n\nUser: <a href="tg://user?id=${session.userId}">${session.username}</a>\nScore: ${session.score} / ${session.target}`, { parse_mode: 'HTML' });
+    delete activeQuizzes[key];
+    return;
+  }
+
+  try {
+    await connectDB();
+    
+    // Pick a random question for the quiz
+    const count = await Question.countDocuments({});
+    const random = Math.floor(Math.random() * count);
+    const q = await Question.findOne().skip(random);
+
+    if (!q) {
+      await bot.telegram.sendMessage(session.chatId, `❌ Out of questions in the database.`);
+      delete activeQuizzes[key];
+      return;
     }
+
+    const rawOptions = [
+      { key: 'A', value: q.options.A },
+      { key: 'B', value: q.options.B },
+      { key: 'C', value: q.options.C },
+      { key: 'D', value: q.options.D }
+    ].filter(o => Boolean(o.value));
+    
+    const options = rawOptions.map(o => o.value);
+    const correct_option_index = rawOptions.findIndex(o => o.key === q.correctAnswer || o.value === q.correctAnswer);
+
+    if (correct_option_index === -1) {
+      console.warn(`Skipping Quiz question ${q._id} because it has an invalid correctAnswer: ${q.correctAnswer}`);
+      return sendNextQuizQuestion(key);
+    }
+
+    const msg = await bot.telegram.sendPoll(session.chatId, `(Q${session.count + 1}/${session.target}) ${q.question}`, options, {
+      type: 'quiz',
+      correct_option_id: correct_option_index,
+      is_anonymous: false, // Must be non-anonymous to track user's answer
+      explanation: q.explanation || 'No explanation available.'
+    });
+
+    session.currentPollId = msg.poll.id;
+    session.correctOptionIndex = correct_option_index;
+    
+  } catch (err) {
+    console.error('Quiz send error:', err.message);
+    delete activeQuizzes[key];
+  }
+}
+
+bot.on('poll_answer', async (ctx) => {
+  const answer = ctx.pollAnswer;
+  const pollId = answer.poll_id;
+  const userId = answer.user.id;
+  
+  // Find the active quiz session matching this poll and user
+  let activeSessionKey = null;
+  for (const [key, session] of Object.entries(activeQuizzes)) {
+    if (session.currentPollId === pollId && session.userId === userId) {
+      activeSessionKey = key;
+      break;
+    }
+  }
+
+  if (activeSessionKey) {
+    const session = activeQuizzes[activeSessionKey];
+    const selectedOption = answer.option_ids[0];
+    
+    if (selectedOption === session.correctOptionIndex) {
+      session.score += 1;
+    }
+    
+    session.count += 1;
+    
+    // Slight delay before sending the next question
+    setTimeout(() => {
+      sendNextQuizQuestion(activeSessionKey);
+    }, 1500);
   }
 });
 
