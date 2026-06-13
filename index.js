@@ -366,7 +366,7 @@ bot.on('message', async (ctx, next) => {
 });
 
 // --- Quiz Marathon Logic ---
-const activeQuizzes = {}; // track in-memory: { chatId_userId: { score: 0, count: 0, target: 50, currentPollId: null, correctOptionIndex: 0 } }
+const activeQuizzes = {}; // track in-memory: { chatId: { score: 0, count: 0, target: 50, userId: starterUserId, username: starterUsername, currentPollId: null, correctOptionIndex: 0 } }
 
 bot.command('quiz', async (ctx) => {
   // Only allow in PM or groups where polls can be non-anonymous. Channels won't work.
@@ -374,9 +374,9 @@ bot.command('quiz', async (ctx) => {
     return ctx.reply('❌ The /quiz command only works in private chats or groups.');
   }
   
-  const key = `${ctx.chat.id}_${ctx.from.id}`;
+  const key = `${ctx.chat.id}`;
   if (activeQuizzes[key]) {
-    return ctx.reply('❌ You already have an active quiz! Please answer the current question.');
+    return ctx.reply('❌ A quiz is already active in this chat! Please answer the current question.');
   }
 
   activeQuizzes[key] = {
@@ -394,13 +394,13 @@ bot.command('quiz', async (ctx) => {
 });
 
 bot.command('end', async (ctx) => {
-  const key = `${ctx.chat.id}_${ctx.from.id}`;
+  const key = `${ctx.chat.id}`;
   const session = activeQuizzes[key];
   if (!session) {
-    return ctx.reply('❌ You do not have an active quiz to end.');
+    return ctx.reply('❌ There is no active quiz in this chat to end.');
   }
 
-  await ctx.reply(`🛑 Quiz Ended Early!\n\nUser: <a href="tg://user?id=${session.userId}">${session.username}</a>\nFinal Score: ${session.score} / ${session.count}`, { parse_mode: 'HTML' });
+  await ctx.reply(`🛑 Quiz Ended Early!\n\nStarted by: <a href="tg://user?id=${session.userId}">${session.username}</a>\nGroup Score: ${session.score} / ${session.count}`, { parse_mode: 'HTML' });
   delete activeQuizzes[key];
 });
 
@@ -410,7 +410,7 @@ async function sendNextQuizQuestion(key) {
 
   if (session.count >= session.target) {
     // Finish Quiz
-    await bot.telegram.sendMessage(session.chatId, `🎉 Quiz Finished!\n\nUser: <a href="tg://user?id=${session.userId}">${session.username}</a>\nScore: ${session.score} / ${session.target}`, { parse_mode: 'HTML' });
+    await bot.telegram.sendMessage(session.chatId, `🎉 Quiz Finished!\n\nStarted by: <a href="tg://user?id=${session.userId}">${session.username}</a>\nGroup Score: ${session.score} / ${session.target}`, { parse_mode: 'HTML' });
     delete activeQuizzes[key];
     return;
   }
@@ -463,12 +463,11 @@ async function sendNextQuizQuestion(key) {
 bot.on('poll_answer', async (ctx) => {
   const answer = ctx.pollAnswer;
   const pollId = answer.poll_id;
-  const userId = answer.user.id;
   
-  // Find the active quiz session matching this poll and user
+  // Find the active quiz session matching this poll
   let activeSessionKey = null;
   for (const [key, session] of Object.entries(activeQuizzes)) {
-    if (session.currentPollId === pollId && session.userId === userId) {
+    if (session.currentPollId === pollId) {
       activeSessionKey = key;
       break;
     }
@@ -478,6 +477,9 @@ bot.on('poll_answer', async (ctx) => {
     const session = activeQuizzes[activeSessionKey];
     const selectedOption = answer.option_ids[0];
     
+    // Lock by resetting currentPollId immediately to prevent duplicate triggers
+    session.currentPollId = null;
+
     if (selectedOption === session.correctOptionIndex) {
       session.score += 1;
     }
@@ -500,6 +502,11 @@ module.exports = async (req, res) => {
     return res.status(200).send('Cron Job Executed');
   }
 
+  if (req.url === '/api/cron-ca') {
+    await postPollCA();
+    return res.status(200).send('CA Cron Job Executed');
+  }
+
   if (req.method === 'POST') {
     await bot.handleUpdate(req.body);
     return res.status(200).send('OK');
@@ -516,6 +523,12 @@ async function runOnce() {
     logStatus();
     console.log('Running scheduled poll post...');
     await postPoll();
+    process.exit(0);
+  }
+  
+  if (args.includes('--cron-ca')) {
+    console.log('Running scheduled CA poll post...');
+    await postPollCA();
     process.exit(0);
   }
   
@@ -568,6 +581,12 @@ if (!process.env.VERCEL) {
       cron.schedule('30 13 * * *', () => scheduleWindowPosts(60));
       cron.schedule('0 20 * * *', () => scheduleWindowPosts(60));
       cron.schedule('0 * * * *', () => generateQuestions(LEVELS[0], TOPICS[0], 50));
+      
+      // Post CA poll every 30 minutes (no daily limit)
+      cron.schedule('*/30 * * * *', () => {
+        console.log('Running 30-minute scheduled CA poll post...');
+        postPollCA();
+      });
       
       // Auto-exit after 15 minutes if running in a CI environment (like GitHub Actions)
       if (process.env.GITHUB_ACTIONS) {
