@@ -385,7 +385,8 @@ bot.command('quiz', async (ctx) => {
     target: 50,
     userId: ctx.from.id,
     chatId: ctx.chat.id,
-    username: ctx.from.username || ctx.from.first_name,
+    username: ctx.from.username,
+    first_name: ctx.from.first_name,
     currentPollId: null,
     correctOptionIndex: 0
   };
@@ -400,7 +401,8 @@ bot.command('end', async (ctx) => {
     return ctx.reply('❌ There is no active quiz in this chat to end.');
   }
 
-  await ctx.reply(`🛑 Quiz Ended Early!\n\nStarted by: <a href="tg://user?id=${session.userId}">${session.username}</a>\nGroup Score: ${session.score} / ${session.count}`, { parse_mode: 'HTML' });
+  const mention = session.username ? `@${session.username}` : `<a href="tg://user?id=${session.userId}">${session.first_name || 'User'}</a>`;
+  await ctx.reply(`🛑 Quiz Ended Early!\n\nStarted by: ${mention}\nGroup Score: ${session.score} / ${session.count}`, { parse_mode: 'HTML' });
   delete activeQuizzes[key];
 });
 
@@ -410,7 +412,8 @@ async function sendNextQuizQuestion(key) {
 
   if (session.count >= session.target) {
     // Finish Quiz
-    await bot.telegram.sendMessage(session.chatId, `🎉 Quiz Finished!\n\nStarted by: <a href="tg://user?id=${session.userId}">${session.username}</a>\nGroup Score: ${session.score} / ${session.target}`, { parse_mode: 'HTML' });
+    const mention = session.username ? `@${session.username}` : `<a href="tg://user?id=${session.userId}">${session.first_name || 'User'}</a>`;
+    await bot.telegram.sendMessage(session.chatId, `🎉 Quiz Finished!\n\nStarted by: ${mention}\nGroup Score: ${session.score} / ${session.target}`, { parse_mode: 'HTML' });
     delete activeQuizzes[key];
     return;
   }
