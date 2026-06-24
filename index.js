@@ -140,20 +140,49 @@ async function postPollCA() {
     
     const options = rawOptions.map(o => o.value);
     const correct_option_index = rawOptions.findIndex(o => o.key === q.correctAnswer || o.value === q.correctAnswer);
-    const questionText = `${q.question}\n(Date: ${caDoc.dateDisplay || caDoc.date})`;
+    const dateLabel = `📅 Date: ${caDoc.dateDisplay || caDoc.date}`;
+    const channelSuffix = `\n\nJoin: ${CHANNEL_LINK}`;
+    const suffix = `\n\n${dateLabel}${channelSuffix}`;
+    // Telegram poll explanation max is 200 chars
+    const maxExp = 200 - suffix.length;
+    const trimmedExp = (q.explanation || '').length > maxExp
+      ? (q.explanation || '').substring(0, maxExp - 1) + '…'
+      : (q.explanation || '');
+    const explanationText = trimmedExp ? `${trimmedExp}${suffix}` : `${dateLabel}${channelSuffix}`;
 
-    await bot.telegram.sendPoll(TARGET_CHANNEL_ID, questionText, options, {
-      type: 'quiz',
-      correct_option_id: correct_option_index,
-      is_anonymous: true,
-      explanation: `${q.explanation || ''}\n\nJoin our channel for more: ${CHANNEL_LINK}`
-    });
+    if (q.question.length <= 295) {
+      // ✅ Normal path: post as poll
+      await bot.telegram.sendPoll(TARGET_CHANNEL_ID, q.question, options, {
+        type: 'quiz',
+        correct_option_id: correct_option_index,
+        is_anonymous: true,
+        explanation: explanationText
+      });
+      console.log(`CA Poll posted to ${TARGET_CHANNEL_ID}`);
+    } else {
+      // ⚠️ Fallback: question too long for poll — send as formatted text message
+      const optionLines = rawOptions.map(o => `  <b>${o.key}.</b> ${o.value}`).join('\n');
+      const correctOption = rawOptions.find(o => o.key === q.correctAnswer || o.value === q.correctAnswer);
+      const correctLabel = correctOption ? `${correctOption.key}. ${correctOption.value}` : q.correctAnswer;
+
+      let textMsg = `🗞️ <b>Current Affairs Quiz</b>\n`;
+      textMsg += `${dateLabel}\n\n`;
+      textMsg += `❓ ${q.question}\n\n`;
+      textMsg += `${optionLines}\n\n`;
+      textMsg += `✅ <b>Answer:</b> <tg-spoiler>${correctLabel}</tg-spoiler>`;
+      if (q.explanation) {
+        textMsg += `\n\n💡 <b>Explanation:</b> ${q.explanation}`;
+      }
+      textMsg += `\n\n🔗 ${CHANNEL_LINK}`;
+
+      await bot.telegram.sendMessage(TARGET_CHANNEL_ID, textMsg, { parse_mode: 'HTML' });
+      console.log(`CA Text Message posted to ${TARGET_CHANNEL_ID} (question too long for poll)`);
+    }
 
     await CurrentAffairs.updateOne(
       { _id: caDoc._id },
       { $set: { [`questions.${qIndex}.isPosted`]: true } }
     );
-    console.log(`CA Poll posted directly to ${TARGET_CHANNEL_ID}`);
   } catch (err) {
     console.error('Post CA Error:', err.message);
   }
