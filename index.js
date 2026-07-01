@@ -3,6 +3,8 @@ process.env.TZ = 'Asia/Kolkata';
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const cron = require('node-cron');
+const { spawn } = require('child_process');
+const path = require('path');
 
 // --- Configuration ---
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -44,6 +46,63 @@ bot.catch((err, ctx) => {
   console.error('Global Bot Error:', err.message);
 });
 
+const caNotificationState = {
+  lastNotifiedDate: null
+};
+
+function getTodayCaDate() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(now);
+
+  const year = parts.find(p => p.type === 'year')?.value;
+  const month = parts.find(p => p.type === 'month')?.value;
+  const day = parts.find(p => p.type === 'day')?.value;
+  return `${year}-${month}-${day}`;
+}
+
+async function triggerSendMessageForCurrentAffairs(caDate) {
+  const scriptPath = path.join(__dirname, 'send_message.js');
+  const child = spawn(process.execPath, [scriptPath], {
+    cwd: __dirname,
+    env: { ...process.env, CA_DATE_FOR_LINK: caDate },
+    stdio: 'inherit'
+  });
+
+  child.on('exit', (code) => {
+    if (code !== 0) {
+      console.error(`send_message.js exited with code ${code}`);
+    }
+  });
+}
+
+async function monitorCaUploads() {
+  try {
+    await connectDB();
+
+    const todayDate = getTodayCaDate();
+    const latestDoc = await CurrentAffairs.findOne({ date: todayDate }).lean();
+
+    if (!latestDoc) {
+      return;
+    }
+
+    if (caNotificationState.lastNotifiedDate === todayDate) {
+      return;
+    }
+
+    caNotificationState.lastNotifiedDate = todayDate;
+    console.log(`🆕 CA upload detected for ${todayDate}. Sending announcement...`);
+    await triggerSendMessageForCurrentAffairs(todayDate);
+  } catch (err) {
+    console.error('CA monitor error:', err.message);
+  }
+}
+
 const ChatSchema = new mongoose.Schema({
   chat_id: { type: String, unique: true },
   title: String,
@@ -81,6 +140,87 @@ async function handleMigration(err, oldId) {
 }
 
 // --- Bot Actions ---
+const caCycleState = {
+  pendingIds: [],
+  usedIds: []
+};
+
+function shuffleArray(items) {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+async function getNextCaSelection() {
+  if (caCycleState.pendingIds.length === 0) {
+    if (caCycleState.usedIds.length > 0) {
+      caCycleState.pendingIds = shuffleArray(caCycleState.usedIds);
+      caCycleState.usedIds = [];
+    } else {
+      const docs = await CurrentAffairs.find({ questions: { $elemMatch: { isPosted: { $ne: true } } } }).sort({ date: 1 });
+      if (!docs || docs.length === 0) {
+        await CurrentAffairs.updateMany({}, { $set: { 'questions.$[].isPosted': false } });
+        const resetDocs = await CurrentAffairs.find({ questions: { $elemMatch: { isPosted: { $ne: true } } } }).sort({ date: 1 });
+        if (!resetDocs || resetDocs.length === 0) {
+          return null;
+        }
+        caCycleState.pendingIds = shuffleArray(resetDocs.map(doc => doc._id.toString()));
+      } else {
+        caCycleState.pendingIds = shuffleArray(docs.map(doc => doc._id.toString()));
+      }
+    }
+  }
+
+  while (caCycleState.pendingIds.length > 0) {
+    const nextId = caCycleState.pendingIds.shift();
+    if (!nextId) continue;
+
+    const doc = await CurrentAffairs.findById(nextId);
+    if (!doc) continue;
+
+    const pendingIndex = doc.questions.findIndex(entry => entry.isPosted !== true);
+    if (pendingIndex === -1) {
+      continue;
+    }
+
+    const candidate = doc.questions[pendingIndex];
+    const rawOptions = [
+      { key: 'A', value: candidate?.options?.A },
+      { key: 'B', value: candidate?.options?.B },
+      { key: 'C', value: candidate?.options?.C },
+      { key: 'D', value: candidate?.options?.D }
+    ].filter(o => Boolean(o.value));
+    const correctOptionIndex = rawOptions.findIndex(o => o.key === candidate?.correctAnswer || o.value === candidate?.correctAnswer);
+    const hasValidQuestion = typeof candidate?.question === 'string' && candidate.question.trim().length > 0 && rawOptions.length >= 2 && correctOptionIndex !== -1;
+
+    if (!hasValidQuestion) {
+      console.warn(`Skipping malformed CA question in ${doc.date || doc._id} because it is missing text, options, or a valid answer.`);
+      await CurrentAffairs.updateOne(
+        { _id: doc._id },
+        { $set: { [`questions.${pendingIndex}.isPosted`]: true } }
+      );
+      continue;
+    }
+
+    caCycleState.usedIds.push(doc._id.toString());
+    return { doc, q: candidate, qIndex: pendingIndex };
+  }
+
+  if (caCycleState.usedIds.length > 0) {
+    caCycleState.pendingIds = shuffleArray(caCycleState.usedIds);
+    caCycleState.usedIds = [];
+    return getNextCaSelection();
+  }
+
+  await CurrentAffairs.updateMany({}, { $set: { 'questions.$[].isPosted': false } });
+  caCycleState.pendingIds = [];
+  caCycleState.usedIds = [];
+  return getNextCaSelection();
+}
+
 async function postPoll() {
   try {
     await connectDB();
@@ -119,17 +259,13 @@ async function postPollCA() {
   try {
     await connectDB();
 
-    // Find the oldest CA document that has an unposted question
-    let caDoc = await CurrentAffairs.findOne({ questions: { $elemMatch: { isPosted: { $ne: true } } } }).sort({ date: 1 });
-
-    if (!caDoc) {
-      console.log('Skip: No CA questions available.');
-      return;
+    const selection = await getNextCaSelection();
+    if (!selection) {
+      console.log('⚠️ No more CA available in DB.');
+      return { posted: false, reason: 'no_more_ca' };
     }
 
-    const qIndex = caDoc.questions.findIndex(q => q.isPosted !== true);
-    if (qIndex === -1) return;
-    const q = caDoc.questions[qIndex];
+    const { doc: caDoc, q, qIndex } = selection;
 
     const rawOptions = [
       { key: 'A', value: q.options.A },
@@ -183,8 +319,12 @@ async function postPollCA() {
       { _id: caDoc._id },
       { $set: { [`questions.${qIndex}.isPosted`]: true } }
     );
+
+    return { posted: true, reason: 'posted' };
   } catch (err) {
-    console.error('Post CA Error:', err.message);
+    const message = err && err.message ? err.message : String(err);
+    console.error('❌ CA post failed:', message);
+    return { posted: false, reason: 'error', error: message };
   }
 }
 
@@ -285,13 +425,45 @@ bot.command(['postnow', 'gen'], adminOnly, async (ctx) => {
 });
 
 bot.command('postnowca', adminOnly, async (ctx) => {
-  await postPollCA();
-  await ctx.reply('✅ CA Poll posted manually.');
+  const result = await postPollCA();
+
+  if (result?.posted) {
+    await ctx.reply('✅ CA Poll posted manually.');
+  } else if (result?.reason === 'no_more_ca') {
+    await ctx.reply('⚠️ No more CA available in DB.');
+  } else {
+    await ctx.reply(`❌ CA post failed: ${result?.error || 'Unknown error'}`);
+  }
+});
+
+bot.command('ms', adminOnly, async (ctx) => {
+  try {
+    await ctx.reply('📤 Sending announcement message...');
+    const scriptPath = path.join(__dirname, 'send_message.js');
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd: __dirname,
+      env: { ...process.env },
+      stdio: 'inherit'
+    });
+
+    child.on('exit', async (code) => {
+      if (code === 0) {
+        await ctx.reply('✅ Announcement message sent.');
+      } else {
+        await ctx.reply(`❌ Announcement message failed with code ${code}.`);
+      }
+    });
+  } catch (err) {
+    console.error('MS command error:', err.message);
+    await ctx.reply(`❌ Failed to run announcement command: ${err.message}`);
+  }
 });
 
 bot.command('reset', adminOnly, async (ctx) => {
   await connectDB();
   const result = await CurrentAffairs.updateMany({}, { $set: { 'questions.$[].isPosted': false } });
+  caCycleState.pendingIds = [];
+  caCycleState.usedIds = [];
   ctx.reply(`✅ Reset questions.`);
 });
 
@@ -417,7 +589,8 @@ bot.command('quiz', async (ctx) => {
     username: ctx.from.username,
     first_name: ctx.from.first_name,
     currentPollId: null,
-    correctOptionIndex: 0
+    correctOptionIndex: 0,
+    usedQuestionIds: []
   };
 
   await sendNextQuizQuestion(key);
@@ -449,17 +622,28 @@ async function sendNextQuizQuestion(key) {
 
   try {
     await connectDB();
-    
-    // Pick a random question for the quiz
-    const count = await Question.countDocuments({});
+
+    const usedQuestionIds = session.usedQuestionIds || [];
+    const query = usedQuestionIds.length ? { _id: { $nin: usedQuestionIds } } : {};
+    const count = await Question.countDocuments(query);
+
+    if (count === 0) {
+      await bot.telegram.sendMessage(session.chatId, `⚠️ No more unique questions are available for this quiz.`);
+      delete activeQuizzes[key];
+      return;
+    }
+
+    // Pick a random question for the quiz without reusing one in the same session
     const random = Math.floor(Math.random() * count);
-    const q = await Question.findOne().skip(random);
+    const q = await Question.findOne(query).skip(random);
 
     if (!q) {
       await bot.telegram.sendMessage(session.chatId, `❌ Out of questions in the database.`);
       delete activeQuizzes[key];
       return;
     }
+
+    session.usedQuestionIds.push(q._id);
 
     const rawOptions = [
       { key: 'A', value: q.options.A },
@@ -487,8 +671,15 @@ async function sendNextQuizQuestion(key) {
     session.correctOptionIndex = correct_option_index;
     
   } catch (err) {
-    console.error('Quiz send error:', err.message);
-    delete activeQuizzes[key];
+    const message = err && err.message ? err.message : String(err);
+    console.error('Quiz send error:', message);
+    session.currentPollId = null;
+
+    if (session.count < session.target) {
+      setTimeout(() => {
+        sendNextQuizQuestion(key);
+      }, 1500);
+    }
   }
 }
 
@@ -607,6 +798,11 @@ if (!process.env.VERCEL) {
       logStatus();
       bot.launch();
       console.log('Bot is running in interactive mode');
+
+      const caMonitorIntervalMs = Number(process.env.CA_MONITOR_INTERVAL_MS || 20000);
+      setInterval(() => {
+        monitorCaUploads();
+      }, caMonitorIntervalMs);
 
       // Internal cron (only if running persistently)
       cron.schedule('0 8 * * *', () => scheduleWindowPosts(60));

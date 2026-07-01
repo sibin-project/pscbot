@@ -26,18 +26,95 @@ async function connectDB() {
 async function postPollCA() {
   const CurrentAffairs = require('./models/CurrentAffairs');
 
-  let caDoc = await CurrentAffairs.findOne({
-    questions: { $elemMatch: { isPosted: { $ne: true } } }
-  }).sort({ date: 1 });
+  const caCycleState = {
+    pendingIds: [],
+    usedIds: []
+  };
 
-  if (!caDoc) {
-    console.log('⚠️  Skip: No unposted CA questions available.');
-    return;
+  function shuffleArray(items) {
+    const arr = [...items];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
   }
 
-  const qIndex = caDoc.questions.findIndex(q => q.isPosted !== true);
-  if (qIndex === -1) return;
-  const q = caDoc.questions[qIndex];
+  async function getNextCaSelection() {
+    if (caCycleState.pendingIds.length === 0) {
+      if (caCycleState.usedIds.length > 0) {
+        console.log('🔄 Reusing CA cycle in random order.');
+        caCycleState.pendingIds = shuffleArray(caCycleState.usedIds);
+        caCycleState.usedIds = [];
+      } else {
+        const docs = await CurrentAffairs.find({ questions: { $elemMatch: { isPosted: { $ne: true } } } }).sort({ date: 1 });
+        if (!docs || docs.length === 0) {
+          console.log('🔄 CA cycle exhausted. Resetting posted flags and starting again.');
+          await CurrentAffairs.updateMany({}, { $set: { 'questions.$[].isPosted': false } });
+          const resetDocs = await CurrentAffairs.find({ questions: { $elemMatch: { isPosted: { $ne: true } } } }).sort({ date: 1 });
+          if (!resetDocs || resetDocs.length === 0) {
+            return null;
+          }
+          caCycleState.pendingIds = shuffleArray(resetDocs.map(doc => doc._id.toString()));
+        } else {
+          caCycleState.pendingIds = shuffleArray(docs.map(doc => doc._id.toString()));
+        }
+      }
+    }
+
+    while (caCycleState.pendingIds.length > 0) {
+      const nextId = caCycleState.pendingIds.shift();
+      if (!nextId) continue;
+
+      const doc = await CurrentAffairs.findById(nextId);
+      if (!doc) continue;
+
+      const pendingIndex = doc.questions.findIndex(entry => entry.isPosted !== true);
+      if (pendingIndex === -1) continue;
+
+      const candidate = doc.questions[pendingIndex];
+      const rawOptions = [
+        { key: 'A', value: candidate?.options?.A },
+        { key: 'B', value: candidate?.options?.B },
+        { key: 'C', value: candidate?.options?.C },
+        { key: 'D', value: candidate?.options?.D }
+      ].filter(o => Boolean(o.value));
+      const correctOptionIndex = rawOptions.findIndex(o => o.key === candidate?.correctAnswer || o.value === candidate?.correctAnswer);
+      const hasValidQuestion = typeof candidate?.question === 'string' && candidate.question.trim().length > 0 && rawOptions.length >= 2 && correctOptionIndex !== -1;
+
+      if (!hasValidQuestion) {
+        console.warn(`Skipping malformed CA question in ${doc.date || doc._id} because it is missing text, options, or a valid answer.`);
+        await CurrentAffairs.updateOne(
+          { _id: doc._id },
+          { $set: { [`questions.${pendingIndex}.isPosted`]: true } }
+        );
+        continue;
+      }
+
+      caCycleState.usedIds.push(doc._id.toString());
+      return { caDoc: doc, q: candidate, qIndex: pendingIndex };
+    }
+
+    if (caCycleState.usedIds.length > 0) {
+      caCycleState.pendingIds = shuffleArray(caCycleState.usedIds);
+      caCycleState.usedIds = [];
+      return getNextCaSelection();
+    }
+
+    console.log('🔄 CA cycle exhausted. Resetting posted flags and starting again.');
+    await CurrentAffairs.updateMany({}, { $set: { 'questions.$[].isPosted': false } });
+    caCycleState.pendingIds = [];
+    caCycleState.usedIds = [];
+    return getNextCaSelection();
+  }
+
+  const selection = await getNextCaSelection();
+  if (!selection) {
+    console.log('⚠️ No more CA available in DB.');
+    return { posted: false, reason: 'no_more_ca' };
+  }
+
+  const { caDoc, q, qIndex } = selection;
 
   const rawOptions = [
     { key: 'A', value: q.options.A },
@@ -95,6 +172,7 @@ async function postPollCA() {
   );
   console.log(`   Question: "${q.question.substring(0, 60)}..."`);
   console.log(`   Date: ${caDoc.dateDisplay || caDoc.date}`);
+  return { posted: true, reason: 'posted' };
 }
 
 (async () => {
@@ -104,7 +182,8 @@ async function postPollCA() {
     await postPollCA();
     process.exit(0);
   } catch (err) {
-    console.error('❌ Error:', err.message);
+    const message = err && err.message ? err.message : String(err);
+    console.error('❌ CA post failed:', message);
     process.exit(1);
   }
 })();
