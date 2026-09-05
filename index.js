@@ -1,6 +1,8 @@
 require('dotenv').config();
 process.env.TZ = 'Asia/Kolkata';
 const { Telegraf, Markup } = require('telegraf');
+const dns = require('node:dns');
+dns.setServers(['1.1.1.1', '8.8.8.8']);
 const mongoose = require('mongoose');
 const cron = require('node-cron');
 const { spawn } = require('child_process');

@@ -2,14 +2,24 @@ require('dotenv').config();
 
 /**
  * send_message.js
+ *
+ * Auto-posts the LATEST available Current Affairs entry from the DB —
+ * not limited to "today". Safe to run on a cron schedule: it tracks the
+ * last date it posted and skips re-sending if nothing new has been added.
  */
 
+const fs = require('fs');
+const path = require('path');
 const { Telegraf } = require('telegraf');
 const mongoose = require('mongoose');
 const CurrentAffairs = require('./models/CurrentAffairs');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = '-1003944522871';
+
+// Where we remember the last date we actually posted, so cron runs
+// don't repost the same "latest" CA over and over.
+const STATE_FILE = path.join(__dirname, '.last_posted_ca_date.json');
 
 if (!BOT_TOKEN) {
   console.error('❌ TELEGRAM_BOT_TOKEN not found in .env file.');
@@ -20,17 +30,46 @@ const args = process.argv.slice(2);
 
 // Extract mode flag
 const modeFlag = args.find(a => a === '--html' || a === '--markdown');
+// Allow forcing a post even if it matches the last-posted date (manual override)
+const forceFlag = args.includes('--force');
 let inputMessage = args.filter(a => !a.startsWith('--')).join(' ');
 
 let parseMode = undefined;
 let message = '';
 const bot = new Telegraf(BOT_TOKEN);
 
-function formatDateFromValue(dateValue) {
+// Safely handles both JS Date objects from Mongoose and YYYY-MM-DD strings
+function getFormattedDates(dateValue) {
   if (!dateValue) return null;
-  const [year, month, day] = String(dateValue).split('-').map(part => part.trim());
-  if (!year || !month || !day) return null;
-  return `${day}/${month}/${year}`;
+
+  const d = new Date(dateValue);
+  if (isNaN(d.getTime())) return null;
+
+  const day = String(d.getDate()).padStart(2, '0');
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const year = d.getFullYear();
+
+  return {
+    displayDate: `${day}/${month}/${year}`,
+    linkDate: `${year}-${month}-${day}`
+  };
+}
+
+function readLastPostedDate() {
+  try {
+    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    return JSON.parse(raw).linkDate || null;
+  } catch {
+    return null; // no state file yet — first run
+  }
+}
+
+function writeLastPostedDate(linkDate) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ linkDate, postedAt: new Date().toISOString() }, null, 2));
+  } catch (err) {
+    console.warn('⚠️ Could not persist last-posted state:', err.message);
+  }
 }
 
 async function connectDB() {
@@ -41,6 +80,9 @@ async function connectDB() {
   });
 }
 
+// Always fetches the absolute latest CA in the DB — regardless of whether
+// it matches today's date. CA_DATE_FOR_LINK env var still lets you force
+// a specific date manually if you ever need to.
 async function getLatestCaDate() {
   if (process.env.CA_DATE_FOR_LINK) {
     return process.env.CA_DATE_FOR_LINK;
@@ -51,36 +93,49 @@ async function getLatestCaDate() {
     const latestDoc = await CurrentAffairs.findOne({}).sort({ date: -1 }).lean();
     return latestDoc?.date || null;
   } catch (err) {
-    console.warn('⚠️ Could not fetch latest CA date from DB, falling back to current date:', err.message);
+    console.warn('⚠️ Could not fetch latest CA date from DB:', err.message);
     return null;
   }
 }
 
 async function buildMessage() {
-  const date = new Date();
-  const day = date.getDate();
-  const month = (date.getMonth() + 1) < 10 ? '0' + (date.getMonth() + 1) : date.getMonth() + 1;
-  const year = date.getFullYear();
   const latestCaDate = await getLatestCaDate();
 
   if (!inputMessage.trim()) {
     if (!latestCaDate) {
-      console.log('⚠️ No latest CA available in DB. Skipping message send.');
+      console.log('⚠️ No CA available in DB yet. Skipping message send.');
       return false;
     }
 
-    const caDateForLink = latestCaDate;
-    const displayDate = formatDateFromValue(caDateForLink) || `${day}/${month}/${year}`;
+    const dates = getFormattedDates(latestCaDate);
+    if (!dates) {
+      console.log('⚠️ Invalid date format retrieved from DB. Skipping.');
+      return false;
+    }
+
+    // Duplicate-post guard: skip if we already posted this exact CA date,
+    // unless --force is passed.
+    if (!forceFlag) {
+      const lastPosted = readLastPostedDate();
+      if (lastPosted === dates.linkDate) {
+        console.log(`ℹ️ Latest CA (${dates.linkDate}) was already posted. Skipping (use --force to repost).`);
+        return false;
+      }
+    }
+
     message = `<b>📢 Kerala PSC Daily Updates! 📢</b>
-📅 ${displayDate} കറന്റ് അഫയേഴ്സും ക്വിസും ഇപ്പോൾ ലൈവ് ആണ്! 🎯
+📅 ${dates.displayDate} കറന്റ് അഫയേഴ്സും ക്വിസും ഇപ്പോൾ ലൈവ് ആണ്! 🎯
 ✅ Daily CA Quiz
 ✅ Important Updates
 
 താഴെയുള്ള ലിങ്ക് വഴി ഇപ്പോൾ തന്നെ ചെക്ക് ചെയ്യൂ:
-🔗https://psc-malayali.codenaxa.in/current-affairs/date/${caDateForLink}
+🔗 https://psc-malayali.vercel.app/current-affairs/date/${dates.linkDate}
 
 #KeralaPSC #DailyQuiz #PSCExam`;
+
     parseMode = 'HTML';
+    // stash so we can mark it posted after a successful send
+    buildMessage._linkDate = dates.linkDate;
     return true;
   } else {
     message = inputMessage;
@@ -96,6 +151,7 @@ async function sendMessage() {
     if (!canSend) {
       process.exit(0);
     }
+
     console.log(`📤 Sending message to channel ${CHANNEL_ID}...`);
 
     const result = await bot.telegram.sendMessage(CHANNEL_ID, message, {
@@ -105,6 +161,12 @@ async function sendMessage() {
 
     console.log('✅ Message sent successfully!');
     console.log(`   Date: ${new Date(result.date * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
+
+    // Remember this date so a repeated cron run today won't repost it
+    if (buildMessage._linkDate) {
+      writeLastPostedDate(buildMessage._linkDate);
+    }
+
     process.exit(0);
   } catch (err) {
     console.error('❌ Failed to send message:', err.message);
