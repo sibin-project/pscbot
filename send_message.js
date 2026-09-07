@@ -83,7 +83,7 @@ async function buildMessage() {
 ✅ Important Updates
 
 താഴെയുള്ള ലിങ്ക് വഴി ഇപ്പോൾ തന്നെ ചെക്ക് ചെയ്യൂ:
-🔗 https://psc-malayali.codenaxa.in/current-affairs/date/${dates.linkDate}
+🔗 https://psc-malayali.vercel.app/current-affairs/date/${dates.linkDate}
 
 #KeralaPSC #DailyQuiz #PSCExam`;
 
